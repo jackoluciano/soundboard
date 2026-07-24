@@ -64,7 +64,7 @@
     font-weight: 600;
     cursor: pointer;
     box-shadow: 0 4px 10px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.05);
-    transition: transform 0.08s ease, box-shadow 0.2s ease, background 0.2s ease;
+    transition: transform 0.08s ease, box-shadow 0.2s ease, background 0.2s ease, opacity 0.2s ease;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -98,6 +98,12 @@
     font-weight: 700;
     letter-spacing: 0.5px;
     color: #64748b;
+  }
+
+  /* State: sedang preload/decode -> belum tentu instan kalau diklik sekarang */
+  .pad.loading {
+    opacity: 0.55;
+    cursor: wait;
   }
 
   /* State: sedang bermain */
@@ -166,12 +172,13 @@
   <div class="grid" id="grid"></div>
 
   <footer>
-    Kalau tombol tetap tidak bunyi, buka file ini bukan lewat double-click biasa
-    (protokol <code>file://</code> sering diblokir browser untuk fetch audio),
-    tapi lewat local server. Cara cepat: buka terminal di folder ini, jalankan
-    <code>python3 -m http.server 8000</code>, lalu akses
-    <code>http://localhost:8000/soundboard.html</code> di browser.
-    Cek juga Console (F12) untuk lihat file mana yang gagal dimuat.
+    Semua file di-preload &amp; di-decode sekali di awal (pakai Web Audio API) supaya klik
+    setelahnya nyaris tanpa delay. Kalau tombol tetap tidak bunyi, buka file ini bukan lewat
+    double-click biasa (protokol <code>file://</code> memblokir <code>fetch()</code> di
+    kebanyakan browser), tapi lewat local server. Cara cepat: buka terminal di folder ini,
+    jalankan <code>python3 -m http.server 8000</code>, lalu akses
+    <code>http://localhost:8000/soundboard.html</code> di browser. Cek juga Console (F12)
+    untuk lihat file mana yang gagal dimuat (tombol dengan tanda "!" di pojok kanan atas).
   </footer>
 
 <script>
@@ -199,16 +206,52 @@
   const grid = document.getElementById('grid');
   const activeCountEl = document.getElementById('activeCount');
 
-  // Per tombol kita simpan STATE, bukan satu Audio tunggal:
-  // state.current   -> instance Audio yang lagi aktif untuk tombol ini (null kalau tidak ada)
-  // state.stage      -> 'idle' | 'playing' | 'stopped'
-  //   idle     : belum pernah main / sudah selesai sendiri -> klik = play dari awal
-  //   playing  : lagi bunyi -> klik = stop (pause di posisi itu)
-  //   stopped  : di-pause di tengah -> klik = restart dari 0
-  const state = {}; // id -> { current, stage, btn, statusSpan }
+  // ------------------------------------------------------
+  // Web Audio API (bukan elemen <audio>).
+  // Elemen <audio> harus fetch+buffer ulang setiap kali instance baru dibuat
+  // -> delay terasa, apalagi di klik pertama tiap tombol.
+  // Dengan Web Audio, semua file di-fetch & di-decode SEKALI jadi AudioBuffer
+  // (PCM mentah di memori). Tiap klik cuma bikin AudioBufferSourceNode baru
+  // dari buffer yang sudah siap, lalu start(0) -> nyaris instan.
+  // ------------------------------------------------------
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  const audioCtx = new AudioContextClass();
 
-  // Set semua Audio instance yang sedang benar-benar playing (lintas tombol), untuk hitung "berapa yang lagi bunyi"
-  const globallyPlaying = new Set();
+  const bufferCache = {};     // id -> AudioBuffer yang sudah di-decode
+  const loadingPromises = {}; // id -> Promise<AudioBuffer>, sementara proses fetch+decode
+
+  function ensureBuffer(sound) {
+    if (bufferCache[sound.id]) return Promise.resolve(bufferCache[sound.id]);
+    if (loadingPromises[sound.id]) return loadingPromises[sound.id];
+
+    const promise = fetch(sound.src)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.arrayBuffer();
+      })
+      .then(arrayBuffer => audioCtx.decodeAudioData(arrayBuffer))
+      .then(decoded => {
+        bufferCache[sound.id] = decoded;
+        delete loadingPromises[sound.id];
+        return decoded;
+      })
+      .catch(err => {
+        delete loadingPromises[sound.id];
+        throw err;
+      });
+
+    loadingPromises[sound.id] = promise;
+    return promise;
+  }
+
+  // Per tombol kita simpan STATE:
+  // state.current -> AudioBufferSourceNode yang aktif untuk tombol ini (null kalau tidak ada)
+  // state.stage   -> 'idle' | 'playing' | 'stopped'
+  //   idle    : belum main / sudah selesai sendiri -> klik = play dari awal
+  //   playing : lagi bunyi -> klik = stop
+  //   stopped : sudah di-stop di tengah -> klik = mulai lagi dari 0
+  const state = {};
+  const globallyPlaying = new Set(); // AudioBufferSourceNode yang sedang benar-benar bunyi
 
   function updateActiveCount() {
     const n = globallyPlaying.size;
@@ -217,7 +260,7 @@
 
   sounds.forEach(sound => {
     const btn = document.createElement('button');
-    btn.className = 'pad';
+    btn.className = 'pad loading';
     btn.dataset.id = sound.id;
 
     const numSpan = document.createElement('span');
@@ -226,7 +269,7 @@
 
     const statusSpan = document.createElement('span');
     statusSpan.className = 'status';
-    statusSpan.textContent = '';
+    statusSpan.textContent = '…';
 
     const labelSpan = document.createElement('span');
     labelSpan.textContent = sound.label;
@@ -244,9 +287,22 @@
       label: sound.label,
     };
 
-    btn.addEventListener('click', () => handlePadClick(sound.id));
+    btn.addEventListener('click', () => handlePadClick(sound.id, sound));
 
     grid.appendChild(btn);
+
+    // Preload + decode di awal supaya klik pertama pun nyaris instan.
+    ensureBuffer(sound)
+      .then(() => {
+        btn.classList.remove('loading');
+        if (state[sound.id].stage === 'idle') statusSpan.textContent = '';
+      })
+      .catch(err => {
+        console.warn(`Gagal preload "${sound.label}" ("${sound.src}"):`, err);
+        btn.classList.remove('loading');
+        statusSpan.textContent = '!';
+        statusSpan.title = 'Gagal dimuat, cek nama file & Console (F12)';
+      });
   });
 
   function setVisual(id) {
@@ -263,15 +319,22 @@
     }
   }
 
-  function handlePadClick(id) {
+  function handlePadClick(id, sound) {
     const s = state[id];
 
+    // Browser mengharuskan AudioContext di-resume lewat user gesture.
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+
     if (s.stage === 'playing') {
-      // ---- KLIK KE-2: STOP di posisi sekarang ----
+      // ---- KLIK KE-2: STOP ----
       if (s.current) {
-        s.current.pause();
+        s.current.onended = null; // cegah onended bawaan stop() ikut nge-reset stage
+        try { s.current.stop(); } catch (e) {}
         globallyPlaying.delete(s.current);
       }
+      s.current = null;
       s.stage = 'stopped';
       setVisual(id);
       updateActiveCount();
@@ -279,66 +342,56 @@
     }
 
     if (s.stage === 'stopped') {
-      // ---- KLIK KE-3: RESTART dari 0 ----
-      // Buang instance lama, buat instance baru dari awal
-      if (s.current) {
-        s.current.pause();
-        s.current.currentTime = 0;
-        globallyPlaying.delete(s.current);
-      }
-      playFresh(id);
+      // ---- KLIK KE-3: ULANG DARI AWAL ----
+      playFresh(id, sound);
       return;
     }
 
-    // ---- KLIK KE-1 (stage 'idle'): PLAY BARU dari awal ----
-    // Instance baru dibuat setiap kali di sini, jadi sound lama dari tombol
-    // LAIN tidak pernah kesenggol, dan beberapa sound bisa numpuk bebas.
-    playFresh(id);
+    // ---- KLIK KE-1 (idle): PLAY BARU ----
+    playFresh(id, sound);
   }
 
-  function playFresh(id) {
+  function playFresh(id, sound) {
     const s = state[id];
-    const audio = new Audio(s.src);
-    audio.preload = "auto";
+    const buffer = bufferCache[id];
 
-    audio.addEventListener('ended', () => {
-      // Hanya reset kalau instance ini masih instance yang sedang aktif untuk tombol ini
-      // (mencegah instance lama yang sudah "dibuang" saat restart ikut nge-reset visual)
-      globallyPlaying.delete(audio);
-      updateActiveCount();
-      if (s.current === audio) {
-        s.stage = 'idle';
-        s.current = null;
-        setVisual(id);
-      }
-    });
+    const startPlayback = (audioBuffer) => {
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioCtx.destination);
 
-    audio.addEventListener('error', () => {
-      console.warn(`Gagal memuat file untuk "${s.label}": "${s.src}". Cek nama file & lokasinya.`);
-      globallyPlaying.delete(audio);
-      updateActiveCount();
-      if (s.current === audio) {
-        s.stage = 'idle';
-        s.current = null;
-        setVisual(id);
-      }
-    });
-
-    audio.play()
-      .then(() => {
-        globallyPlaying.add(audio);
+      source.onended = () => {
+        globallyPlaying.delete(source);
         updateActiveCount();
-      })
-      .catch(err => {
-        console.warn(`Gagal memutar "${s.label}":`, err);
-        s.stage = 'idle';
-        s.current = null;
-        setVisual(id);
-      });
+        if (s.current === source) {
+          s.stage = 'idle';
+          s.current = null;
+          setVisual(id);
+        }
+      };
 
-    s.current = audio;
-    s.stage = 'playing';
-    setVisual(id);
+      source.start(0);
+      s.current = source;
+      s.stage = 'playing';
+      globallyPlaying.add(source);
+      updateActiveCount();
+      setVisual(id);
+    };
+
+    if (buffer) {
+      // Sudah ter-decode -> start() nyaris instan.
+      startPlayback(buffer);
+    } else {
+      // Jarang kejadian setelah preload selesai (misalnya preload sempat gagal).
+      s.statusSpan.textContent = '…';
+      ensureBuffer(sound)
+        .then(startPlayback)
+        .catch(err => {
+          console.warn(`Gagal memutar "${s.label}":`, err);
+          s.stage = 'idle';
+          setVisual(id);
+        });
+    }
   }
 </script>
 
